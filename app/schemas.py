@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import re
+from decimal import Decimal
 from typing import Optional
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+from .aliquots import MAX_QTY_DIGITS, parse_qty
 
 _TIME_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$"
@@ -209,6 +212,100 @@ class FindingRelease(BaseModel):
         v = v.strip()
         if not v:
             raise ValueError("认领人不能为空")
+        return v
+
+    @field_validator("note")
+    @classmethod
+    def _strip_note(cls, v: str) -> str:
+        return v.strip()
+
+
+class InitialQuantitySet(BaseModel):
+    """首次分装前为父样本设置初始数量与单位（精确十进制）。
+
+    必须携带客户端看到的样本版本号 ``expected_version``（乐观锁）；
+    版本过期（并发变更 / 重复提交）时服务端返回 409。
+    一旦该样本发起过分装，初始数量与单位即固化，不能再修改。
+    """
+
+    initial_qty: Decimal = Field(...)
+    unit: str = Field(..., min_length=1, max_length=16)
+    expected_version: int = Field(..., ge=1)
+
+    @field_validator("initial_qty")
+    @classmethod
+    def _check_qty(cls, v: Decimal) -> Decimal:
+        try:
+            parse_qty(v, "初始数量")
+        except ValueError as exc:
+            raise ValueError(str(exc))
+        return v
+
+    @field_validator("unit")
+    @classmethod
+    def _strip_unit(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("单位不能为空")
+        return v
+
+
+class AliquotChild(BaseModel):
+    """一次分装中的单个子样本：编号唯一、分装量为正十进制。"""
+
+    code: str = Field(..., min_length=1, max_length=64)
+    name: str = Field(..., min_length=1, max_length=128)
+    qty: Decimal = Field(...)
+    unit: Optional[str] = Field(None, max_length=16)
+    description: str = Field("", max_length=512)
+
+    @field_validator("code", "name")
+    @classmethod
+    def _strip(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("不能为空")
+        return v
+
+    @field_validator("description")
+    @classmethod
+    def _strip_desc(cls, v: str) -> str:
+        return v.strip()
+
+    @field_validator("unit")
+    @classmethod
+    def _strip_unit(cls, v: Optional[str]) -> Optional[str]:
+        return v.strip() if v else None
+
+    @field_validator("qty")
+    @classmethod
+    def _check_qty(cls, v: Decimal) -> Decimal:
+        try:
+            parse_qty(v, "分装量")
+        except ValueError as exc:
+            raise ValueError(str(exc))
+        return v
+
+
+class AliquotBatchCreate(BaseModel):
+    """从当前样本发起一次分装：多个子样本编号与分装量。
+
+    服务端在单一事务内校验编号唯一（批次内 + 全局）、单位一致、分装量为正、
+    合计不超过父样本可用余量，并以 ``expected_version`` 做乐观锁——
+    重复提交或并发变更返回 409，且不产生任何部分记录。
+    """
+
+    expected_version: int = Field(..., ge=1)
+    operator: str = Field(..., min_length=1, max_length=64)
+    note: str = Field("", max_length=512)
+    children: list[AliquotChild] = Field(..., min_length=1)
+
+    @field_validator("operator")
+    @classmethod
+    def _strip_operator(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("分装操作人不能为空")
         return v
 
     @field_validator("note")

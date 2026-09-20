@@ -613,3 +613,89 @@ tr.att-row-corrupt { background: #fff5f5; }
   background: var(--bad-text); color: #fff;
 }
 .seal-issue-msg { flex: 1; min-width: 200px; }
+
+/* ---------- 样本分装谱系 ---------- */
+.lineage-origin {
+  display: flex; align-items: center; flex-wrap: wrap; gap: 4px;
+  margin-bottom: 12px; font-size: 12.5px;
+}
+.lineage-crumb {
+  border: 1px solid var(--border); background: #f8fafc;
+  border-radius: 6px; padding: 2px 10px; cursor: pointer;
+  font-size: 12.5px; color: var(--primary);
+}
+.lineage-crumb:hover { background: #eff6ff; }
+.lineage-crumb.current {
+  background: #dbeafe; border-color: var(--primary); font-weight: 600;
+}
+.lineage-sep { color: var(--muted); margin: 0 2px; }
+
+.lineage-tree { margin-top: 10px; }
+.lineage-node {
+  position: relative;
+  margin-top: 8px;
+  padding-left: 14px;
+  border-left: 2px solid var(--border);
+}
+.lineage-node > .lineage-node-card::before {
+  content: ""; position: absolute; left: -16px; top: 22px;
+  width: 14px; height: 2px; background: var(--border);
+}
+.lineage-node.is-current > .lineage-node-card {
+  border-color: var(--primary);
+  box-shadow: 0 0 0 2px rgba(37, 99, 235, 0.12);
+}
+.lineage-node-card {
+  position: relative;
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 12px; flex-wrap: wrap;
+  background: #f8fafc; border: 1px solid var(--border);
+  border-radius: 8px; padding: 9px 12px;
+}
+.lineage-node-main {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+}
+.lineage-name {
+  border: none; background: none; cursor: pointer; padding: 0;
+  font-weight: 700; font-size: 13.5px; color: var(--text);
+}
+.lineage-name:hover { color: var(--primary); text-decoration: underline; }
+.lineage-name.current { color: var(--primary); }
+.lineage-in-tag {
+  font-size: 11.5px; color: var(--muted);
+  background: #eef2f7; border-radius: 4px; padding: 1px 8px;
+}
+.lineage-in-tag.root { background: #ecfdf5; color: var(--ok-text); }
+.lineage-parent-link {
+  border: none; background: none; padding: 0; cursor: pointer;
+  color: var(--primary); font-size: 11.5px;
+}
+.lineage-parent-link:hover { text-decoration: underline; }
+.lineage-batches { margin: 4px 0 2px 14px; }
+.lineage-batch {
+  border-left: 3px solid #93c5fd; background: #f0f7ff;
+  border-radius: 0 6px 6px 0; padding: 5px 10px; margin-bottom: 4px;
+}
+.lineage-batch-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  font-size: 12px;
+}
+
+/* 发起分装弹窗 */
+.aliquot-parent-info { margin-bottom: 12px; }
+.aliquot-children-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin: 12px 0 6px;
+}
+.aliquot-children-head h4 { margin: 0; font-size: 13.5px; }
+.aq-row input {
+  width: 100%; padding: 5px 8px;
+  border: 1px solid var(--border); border-radius: 5px; font-size: 13px;
+}
+.aliquot-total-line { margin: 10px 0 4px; font-size: 13px; }
+.aliquot-total-ok { color: var(--ok-text); }
+.aliquot-total-bad { color: var(--bad-text); font-weight: 600; }
+.aliquot-qty-flow {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: #f8fafc; border-radius: 6px; padding: 8px 12px;
+}

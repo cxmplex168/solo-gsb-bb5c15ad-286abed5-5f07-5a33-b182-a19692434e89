@@ -193,6 +193,49 @@ CREATE TABLE IF NOT EXISTS attachments (
 
 CREATE INDEX IF NOT EXISTS idx_attachments_event ON attachments(event_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_digest ON attachments(blob_digest);
+
+-- 样本分装谱系：samples 增加 parent_id 与数量 / 单位列（见 _migrate 轻量补齐）。
+-- 初始数量 initial_qty 在首次分装前设置；remaining_qty 为扣减后的可用余量；
+-- unit 为全谱系一致的计量单位；version 为样本级乐观锁，任何数量 / 父子关系
+-- 变化（设置初始量、发起分装）都使其 +1，分装请求必须携带客户端看到的版本，
+-- 过期（重复提交 / 并发变更）一律 409。数量以规范化十进制文本精确存储。
+-- parent_id 自引用，默认 ON DELETE RESTRICT 由应用层「有后代禁止删除」先拦截；
+-- 删除叶子子样本不影响谱系（aliquot_items.child_sample_id 置 NULL，批次仍完整）。
+CREATE TABLE IF NOT EXISTS aliquot_batches (
+    id                         INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_no                   TEXT    NOT NULL UNIQUE,
+    parent_sample_id           INTEGER NOT NULL REFERENCES samples(id) ON DELETE CASCADE,
+    operator                   TEXT    NOT NULL,
+    note                       TEXT    NOT NULL DEFAULT '',
+    created_at                 TEXT    NOT NULL,
+    parent_initial_qty         TEXT    NOT NULL,
+    parent_remaining_before    TEXT    NOT NULL,
+    parent_remaining_after     TEXT    NOT NULL,
+    parent_version_before      INTEGER NOT NULL,
+    total_qty                  TEXT    NOT NULL,
+    snapshot                   TEXT    NOT NULL,
+    digest                     TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_aliquot_batches_parent ON aliquot_batches(parent_sample_id);
+
+-- 不可变批次明细：一次分装的每个子样本一行。child_sample_id 在叶子子样本被
+-- 删除时置 NULL（批次记录仍完整可查），故不加 ON DELETE CASCADE。
+CREATE TABLE IF NOT EXISTS aliquot_items (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id        INTEGER NOT NULL REFERENCES aliquot_batches(id) ON DELETE CASCADE,
+    child_sample_id INTEGER REFERENCES samples(id) ON DELETE SET NULL,
+    line_no         INTEGER NOT NULL,
+    code            TEXT    NOT NULL,
+    name            TEXT    NOT NULL,
+    description     TEXT    NOT NULL DEFAULT '',
+    qty             TEXT    NOT NULL,
+    unit            TEXT    NOT NULL,
+    created_at      TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_aliquot_items_batch ON aliquot_items(batch_id);
+CREATE INDEX IF NOT EXISTS idx_aliquot_items_child ON aliquot_items(child_sample_id);
 """
 
 
@@ -202,6 +245,8 @@ def _migrate(conn: sqlite3.Connection) -> None:
     * findings 增加限时认领租约三列 claimed_by / claimed_at / claim_expires_at；
     * finding_transitions 增加 event 列（state/claim/release/takeover/lease_void）。
     旧迁移记录没有认领事件概念，统一回填为 state。
+    * samples 增加分装谱系列 parent_id / initial_qty / remaining_qty / unit /
+      version（旧样本为尚未设置数量的独立样本，version 初始 1）。
     """
     finding_cols = {r["name"] for r in conn.execute("PRAGMA table_info(findings)")}
     for name, ddl in (
@@ -215,6 +260,21 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "event" not in trans_cols:
         conn.execute("ALTER TABLE finding_transitions ADD COLUMN event TEXT NOT NULL DEFAULT 'state'")
         conn.execute("UPDATE finding_transitions SET event = 'state' WHERE event IS NULL OR event = ''")
+
+    sample_cols = {r["name"] for r in conn.execute("PRAGMA table_info(samples)")}
+    for name, ddl in (
+        ("parent_id", "ALTER TABLE samples ADD COLUMN parent_id INTEGER REFERENCES samples(id)"),
+        ("initial_qty", "ALTER TABLE samples ADD COLUMN initial_qty TEXT"),
+        ("remaining_qty", "ALTER TABLE samples ADD COLUMN remaining_qty TEXT"),
+        ("unit", "ALTER TABLE samples ADD COLUMN unit TEXT"),
+        ("version", "ALTER TABLE samples ADD COLUMN version INTEGER NOT NULL DEFAULT 1"),
+    ):
+        if name not in sample_cols:
+            conn.execute(ddl)
+    # SQLite 的 ALTER ADD COLUMN 无法带非空默认以外的约束；补一个自引用父子索引
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent_id)"
+    )
 
 
 def init_db() -> None:
@@ -287,6 +347,53 @@ def _seed_demo_data(conn: sqlite3.Connection) -> None:
         event_ids2.append(ins.lastrowid)
 
     _seed_handovers(conn, sid, event_ids, rows, sid2, event_ids2, rows2, now)
+    _seed_lineage_demo(conn, now)
+
+
+def _seed_lineage_demo(conn: sqlite3.Connection, now: str) -> None:
+    """预置一个三级样本分装谱系（初始 100 mL -> 3 个子样本 -> 孙样本）。"""
+    from decimal import Decimal
+
+    from .aliquots import create_aliquot_batch, set_initial_quantity
+
+    cur = conn.execute(
+        "INSERT INTO samples (code, name, description, created_at) VALUES (?, ?, ?, ?)",
+        ("SAM-DEMO-003", "演示样本·分装谱系", "演示初始量设置、批次分装与多级子样本树", now),
+    )
+    root_id = cur.lastrowid
+    set_initial_quantity(conn, root_id, Decimal("100"), "mL", expected_version=1)
+
+    first = create_aliquot_batch(
+        conn,
+        root_id,
+        operator="陈九（制备组）",
+        note="首次分装为三份留样",
+        children=[
+            {"code": "SAM-DEMO-003-A", "name": "子样本 A", "description": "送检份",
+             "qty": Decimal("30"), "unit": "mL"},
+            {"code": "SAM-DEMO-003-B", "name": "子样本 B", "description": "备份份",
+             "qty": Decimal("30"), "unit": "mL"},
+            {"code": "SAM-DEMO-003-C", "name": "子样本 C", "description": "留存份",
+             "qty": Decimal("20"), "unit": "mL"},
+        ],
+        expected_version=2,
+    )
+    child_a = first["child_ids"][0]
+
+    # 子样本 A 继续分装为两个孙样本（10 + 15 = 25，余 5 mL）
+    create_aliquot_batch(
+        conn,
+        child_a,
+        operator="陈九（制备组）",
+        note="送检份再分注",
+        children=[
+            {"code": "SAM-DEMO-003-A1", "name": "孙样本 A1", "description": "平行样 1",
+             "qty": Decimal("10"), "unit": "mL"},
+            {"code": "SAM-DEMO-003-A2", "name": "孙样本 A2", "description": "平行样 2",
+             "qty": Decimal("15"), "unit": "mL"},
+        ],
+        expected_version=1,
+    )
 
 
 def _seed_handovers(

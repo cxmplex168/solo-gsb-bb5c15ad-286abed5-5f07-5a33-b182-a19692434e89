@@ -141,6 +141,38 @@
           <ul id="findings" class="findings"></ul>
         </section>
 
+        <!-- 样本分装谱系 -->
+        <section class="card">
+          <div class="card-head">
+            <h3>样本分装谱系</h3>
+            <span class="head-hint">首次分装前设置初始数量与单位；从当前样本发起批次分装，子样本可继续分装；批次不可变，重复提交 / 并发变更返回 409</span>
+          </div>
+          <div id="lineage-origin" class="lineage-origin"></div>
+
+          <!-- 未设置初始数量：父样本先设置 -->
+          <form id="init-qty-form" class="event-form">
+            <div class="form-grid form-grid-3">
+              <label>初始数量
+                <input type="text" id="iq-qty" inputmode="decimal" maxlength="40" placeholder="精确十进制，如 100 / 0.25" required />
+              </label>
+              <label>单位
+                <input type="text" id="iq-unit" maxlength="16" placeholder="如 mL / g / 管" required />
+              </label>
+              <label class="form-note">说明
+                <input type="text" value="设置后在首次分装前仍可凭版本号修正" disabled />
+              </label>
+            </div>
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary">设置初始数量与单位</button>
+            </div>
+          </form>
+
+          <div id="lineage-tree-wrap" class="lineage-tree-wrap" hidden>
+            <div id="lineage-stats" class="handover-stats"></div>
+            <div id="lineage-tree" class="lineage-tree"></div>
+          </div>
+        </section>
+
         <!-- 结论签署 -->
         <section class="card">
           <div class="card-head">
@@ -538,6 +570,55 @@
       <div id="finding-history-body" class="signoff-detail"></div>
       <div class="form-actions">
         <button type="button" id="btn-close-finding-history" class="btn btn-ghost">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 发起分装弹窗 -->
+  <div id="aliquot-modal" class="modal-mask" hidden>
+    <div class="modal modal-wide">
+      <div class="card-head">
+        <h3>发起样本分装</h3>
+        <span class="head-hint">单一事务提交：编号唯一、单位一致、分装量为正且合计不超过可用余量；重复提交或并发变更将返回 409</span>
+      </div>
+      <div id="aliquot-parent-info" class="aliquot-parent-info"></div>
+      <form id="aliquot-form">
+        <div class="form-grid form-grid-3">
+          <label>分装操作人
+            <input type="text" id="aq-operator" maxlength="64" placeholder="如：制备组 陈九" required />
+          </label>
+          <label class="form-note" style="grid-column: span 2;">批次备注
+            <input type="text" id="aq-note" maxlength="512" placeholder="可选，如：首次分装为三份留样" />
+          </label>
+        </div>
+        <div class="aliquot-children-head">
+          <h4>子样本（分装量单位：<span id="aq-unit-label"></span>）</h4>
+          <button type="button" class="btn btn-small" id="btn-aq-add-row">＋ 添加子样本</button>
+        </div>
+        <div class="table-wrap">
+          <table class="event-table">
+            <thead>
+              <tr><th>#</th><th>子样本编号</th><th>名称</th><th>分装量</th><th>描述（可选）</th><th></th></tr>
+            </thead>
+            <tbody id="aq-rows-tbody"></tbody>
+          </table>
+        </div>
+        <div id="aq-total-line" class="aliquot-total-line"></div>
+        <div class="form-actions">
+          <button type="submit" class="btn btn-primary">提交分装（单一事务）</button>
+          <button type="button" id="btn-close-aliquot" class="btn btn-ghost">取消</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- 分装批次详情弹窗 -->
+  <div id="batch-modal" class="modal-mask" hidden>
+    <div class="modal modal-wide">
+      <h3>分装批次详情</h3>
+      <div id="batch-detail-body" class="signoff-detail"></div>
+      <div class="form-actions">
+        <button type="button" id="btn-close-batch" class="btn btn-ghost">关闭</button>
       </div>
     </div>
   </div>

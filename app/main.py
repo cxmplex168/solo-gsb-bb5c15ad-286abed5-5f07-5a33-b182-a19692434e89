@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import sqlite3
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Optional
@@ -34,6 +35,14 @@ from .attachments import (
     verify_and_prepare_download,
 )
 
+from .aliquots import (
+    AliquotError,
+    build_lineage,
+    create_aliquot_batch,
+    get_batch_detail,
+    has_descendants,
+    set_initial_quantity,
+)
 from .audit import build_audit
 from .bulk_import import (
     CSV_HEADERS,
@@ -69,12 +78,14 @@ from .seal_package import (
     verify_seal_package,
 )
 from .schemas import (
+    AliquotBatchCreate,
     BulkImportConfirm,
     EventCreate,
     FindingClaim,
     FindingDispose,
     FindingRelease,
     HandoverConfirm,
+    InitialQuantitySet,
     SampleCreate,
     SignoffCreate,
     SignoffRevoke,
@@ -107,6 +118,11 @@ def _sample_dict(row: Any) -> dict[str, Any]:
         "name": row["name"],
         "description": row["description"],
         "created_at": row["created_at"],
+        "parent_id": row["parent_id"],
+        "initial_qty": row["initial_qty"],
+        "remaining_qty": row["remaining_qty"],
+        "unit": row["unit"],
+        "version": row["version"],
     }
 
 
@@ -174,12 +190,19 @@ def get_sample(sample_id: int, conn: Connection = Depends(get_conn)) -> dict[str
         "signoffs": _list_signoffs(conn, sample_id),
         "handovers": build_handover_view(conn, sample_id),
         "attachments": list_sample_attachments(conn, sample_id),
+        "lineage": build_lineage(conn, sample_id),
     }
 
 
 @app.delete("/api/samples/{sample_id}", status_code=204)
 def delete_sample(sample_id: int, conn: Connection = Depends(get_conn)) -> Response:
     _fetch_sample(conn, sample_id)
+    # 已有分装后代的样本禁止删除（根 / 中间节点删除会破坏不可变谱系）
+    if has_descendants(conn, sample_id):
+        raise HTTPException(
+            status_code=409,
+            detail="该样本已有分装后代（子 / 孙样本），禁止删除；可删除未再分装的叶子样本",
+        )
     # 证据附件必须先逐事件处理（下载留档后删除附件记录），禁止连带删除
     attached = attachment_count_for_sample(conn, sample_id)
     if attached:
@@ -253,6 +276,88 @@ def delete_event(event_id: int, conn: Connection = Depends(get_conn)) -> Respons
     sync_sample_findings(conn, sample_id)
     conn.commit()
     return Response(status_code=204)
+
+
+# ---------- 样本分装谱系 ----------
+
+@app.put("/api/samples/{sample_id}/initial-quantity")
+def set_sample_initial_quantity(
+    sample_id: int, payload: InitialQuantitySet, conn: Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """首次分装前为父样本设置初始数量与单位（精确十进制文本存储）。
+
+    必须携带样本版本号 expected_version：重复提交 / 并发变更返回 409。
+    一旦发起过分装，初始数量与单位固化，不能再修改。
+    """
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            result = set_initial_quantity(
+                conn,
+                sample_id,
+                payload.initial_qty,
+                payload.unit,
+                payload.expected_version,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    except AliquotError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    return result
+
+
+@app.post("/api/samples/{sample_id}/aliquots", status_code=201)
+def create_aliquot(
+    sample_id: int, payload: AliquotBatchCreate, conn: Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """从当前样本发起一次分装（多个子样本编号 + 分装量）。
+
+    服务端在单一事务（BEGIN IMMEDIATE）内校验编号唯一、单位一致、分装量为正、
+    合计不超过可用余量，并携带父样本版本做乐观锁；成功后创建子样本、扣减父样本
+    余量并保存不可变批次。重复提交 / 并发变更返回 409，绝不产生部分记录。
+    """
+    try:
+        # BEGIN IMMEDIATE 立即取写锁：版本检查 -> 唯一性检查 -> 余量扣减全程持锁
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            result = create_aliquot_batch(
+                conn,
+                sample_id,
+                payload.operator,
+                payload.note,
+                [c.model_dump() for c in payload.children],
+                payload.expected_version,
+            )
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+    except AliquotError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    except sqlite3.IntegrityError:
+        # 唯一约束兜底（并发下编号恰好冲突）：事务已回滚，无部分写入
+        raise HTTPException(status_code=409, detail="样本编号冲突，分装失败（数据未写入，请刷新后重试）")
+    return result
+
+
+@app.get("/api/samples/{sample_id}/lineage")
+def get_lineage(sample_id: int, conn: Connection = Depends(get_conn)) -> dict[str, Any]:
+    """以当前样本的根祖先为根的完整分装父子树（来源 / 批次 / 分装量 / 剩余量）。"""
+    try:
+        return build_lineage(conn, sample_id)
+    except AliquotError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.get("/api/aliquot-batches/{batch_id}")
+def get_aliquot_batch(batch_id: int, conn: Connection = Depends(get_conn)) -> dict[str, Any]:
+    """不可变分装批次详情：批次头 + 逐子样本明细 + 快照完整性现场校验。"""
+    try:
+        return get_batch_detail(conn, batch_id)
+    except AliquotError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
 
 # ---------- 事件证据附件（内容寻址存储） ----------
