@@ -164,6 +164,8 @@
       state.currentId = id;
       state.data = await api(`/api/samples/${id}`);
       state.editingId = null;
+      linState.rows = [];
+      $("#aliquot-form").reset();
       setView("sample");
       renderAll();
       $("#empty-state").hidden = true;
@@ -180,6 +182,7 @@
 
   function renderAll() {
     renderSample();
+    renderLineage();
     renderAudit();
     renderHandovers();
     renderTimeline();
@@ -1557,6 +1560,373 @@
     } catch (err) {
       toast(err.message, true);
     }
+  });
+
+  // ---------- 样本分装谱系 ----------
+
+  const linState = { rows: [] }; // 分装表单的子样本行 [{ code, name, quantity }]
+
+  function curSample() {
+    return (state.data && state.data.sample) || null;
+  }
+
+  function renderLineage() {
+    const sample = curSample();
+    if (!sample) return;
+    const ready = sample.initial_quantity != null;
+    const unit = sample.unit || "";
+
+    // 当前样本数量状态
+    $("#lin-current").innerHTML = ready
+      ? [
+          statChip(sample.initial_quantity, `初始数量（${esc(unit)}）`, ""),
+          statChip(sample.remaining_quantity, `当前剩余（${esc(unit)}）`, "ok"),
+          statChip(sample.version, "样本版本", "muted"),
+          sample.parent_sample_id
+            ? `<span class="ho-stat warn"><b>谱系来源</b> 子样本（由批次分装产生）</span>`
+            : `<span class="ho-stat muted"><b>谱系来源</b> 根样本（最初父样本）</span>`,
+        ].join("")
+      : [
+          statChip("未设置", "初始数量", "bad"),
+          statChip(sample.version, "样本版本", "muted"),
+          `<span class="ho-stat warn"><b>首次分装前</b> 请先设置初始数量与单位</span>`,
+        ].join("");
+
+    // 首次分装前的数量初始化表单（仅在未设置时可见）
+    $("#qty-form").hidden = ready;
+    if (!ready) {
+      $("#qty-form").reset();
+      $(".lin-version-hint").textContent =
+        `提交将基于当前样本版本 v${sample.version}（乐观锁）；` +
+        "若期间样本被他人改动，服务端返回 409 并刷新页面。";
+    }
+
+    // 分装表单（已设置数量才可见；余量为 0 时禁用提交）
+    const form = $("#aliquot-form");
+    form.hidden = !ready;
+    if (ready) {
+      $("#al-available").textContent = `${sample.remaining_quantity} ${unit}`;
+      if (!linState.rows.length) addAliquotRow();
+      renderAliquotRows();
+    }
+
+    renderLineageTree();
+  }
+
+  // ---- 分装表单：子样本动态行 ----
+
+  function addAliquotRow(code = "", name = "", quantity = "") {
+    linState.rows.push({ code, name, quantity });
+  }
+
+  function renderAliquotRows() {
+    const wrap = $("#al-rows");
+    if (!linState.rows.length) {
+      wrap.innerHTML = `<div class="muted-cell" style="padding:8px 0">请点击「＋ 添加子样本」至少填写一个子样本</div>`;
+    } else {
+      wrap.innerHTML = linState.rows
+        .map(
+          (r, i) => `
+        <div class="al-row" data-idx="${i}">
+          <input type="text" class="al-code" maxlength="64" placeholder="子样本编号（唯一）" value="${esc(r.code)}" />
+          <input type="text" class="al-name" maxlength="128" placeholder="名称（可选，默认同编号）" value="${esc(r.name)}" />
+          <input type="text" class="al-qty" maxlength="40" inputmode="decimal" placeholder="分装量" value="${esc(r.quantity)}" />
+          <button type="button" class="link-btn btn-del al-del" data-del="${i}">移除</button>
+        </div>`
+        )
+        .join("");
+    }
+    updateAliquotSum();
+  }
+
+  function syncAliquotRows() {
+    $("#al-rows")
+      .querySelectorAll(".al-row")
+      .forEach((el) => {
+        const i = Number(el.dataset.idx);
+        linState.rows[i].code = el.querySelector(".al-code").value.trim();
+        linState.rows[i].name = el.querySelector(".al-name").value.trim();
+        linState.rows[i].quantity = el.querySelector(".al-qty").value.trim();
+      });
+  }
+
+  function updateAliquotSum() {
+    // 前端只做形态提示；权威的精确十进制合计 / 余量比较在服务端完成
+    const filled = linState.rows.filter((r) => r.quantity.trim()).length;
+    const bad = linState.rows.some(
+      (r) => r.quantity.trim() && !/^\d+(\.\d+)?$/.test(r.quantity.trim())
+    );
+    $("#al-sum").innerHTML = bad
+      ? `<span class="ho-stat bad"><b>合计</b> 存在无法识别的分装量，请输入正十进制（如 30、0.25）</span>`
+      : `<span class="ho-stat ${filled ? "" : "muted"}"><b>已填 ${filled} 行</b> 合计与余量由服务端按精确十进制校验</span>`;
+  }
+
+  $("#btn-add-al-row").addEventListener("click", () => {
+    syncAliquotRows();
+    addAliquotRow();
+    renderAliquotRows();
+    const inputs = $("#al-rows").querySelectorAll(".al-code");
+    inputs[inputs.length - 1].focus();
+  });
+
+  $("#al-rows").addEventListener("input", () => {
+    syncAliquotRows();
+    updateAliquotSum();
+  });
+
+  $("#al-rows").addEventListener("click", (e) => {
+    const btn = e.target.closest("button[data-del]");
+    if (!btn) return;
+    syncAliquotRows();
+    linState.rows.splice(Number(btn.dataset.del), 1);
+    renderAliquotRows();
+  });
+
+  // ---- 设置初始数量 / 单位 ----
+
+  $("#qty-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const sample = curSample();
+    const payload = {
+      initial_quantity: $("#q-amount").value.trim(),
+      unit: $("#q-unit").value.trim(),
+      expected_version: sample.version,
+    };
+    if (!payload.initial_quantity || !payload.unit) {
+      toast("请填写初始数量与单位", true);
+      return;
+    }
+    if (!/^\d+(\.\d+)?$/.test(payload.initial_quantity)) {
+      toast("初始数量必须是正十进制（如 100、0.25），且不要使用科学计数法", true);
+      return;
+    }
+    try {
+      const r = await api(`/api/samples/${sample.id}/quantity`, {
+        method: "PUT",
+        body: JSON.stringify(payload),
+      });
+      toast(`已设置初始数量 ${r.initial_quantity} ${r.unit}（v${r.version}）`);
+      await reloadCurrentSample(sample.id);
+      linState.rows = [];
+    } catch (err) {
+      toast(err.message, true);
+      if (err.status === 409) await reloadCurrentSample(sample.id);
+    }
+  });
+
+  // ---- 执行分装 ----
+
+  $("#aliquot-form").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const sample = curSample();
+    syncAliquotRows();
+    const rows = linState.rows.filter(
+      (r) => r.code.trim() || r.name.trim() || r.quantity.trim()
+    );
+    if (!rows.length) {
+      toast("请至少添加一个子样本", true);
+      return;
+    }
+    for (const r of rows) {
+      if (!r.code.trim()) return toast("每个子样本都必须填写编号", true);
+      if (!r.quantity.trim()) return toast(`子样本 ${r.code} 的分装量不能为空`, true);
+      if (!/^\d+(\.\d+)?$/.test(r.quantity.trim()))
+        return toast(`子样本 ${r.code} 的分装量必须是正十进制`, true);
+    }
+    const operator = $("#al-operator").value.trim();
+    if (!operator) return toast("请填写操作人", true);
+
+    const payload = {
+      operator,
+      aliquot_at: $("#al-at").value || null,
+      note: $("#al-note").value.trim(),
+      expected_version: sample.version,
+      items: rows.map((r) => ({
+        code: r.code.trim(),
+        name: r.name.trim() || null,
+        quantity: r.quantity.trim(),
+      })),
+    };
+    if (
+      !confirm(
+        `确认从 ${sample.code} 分装 ${rows.length} 个子样本？\n` +
+          "服务端将在单一事务内校验编号唯一、单位一致、分装量为正且合计不超过余量；\n" +
+          "成功后子样本创建、余量扣减与不可变批次一并落库。"
+      )
+    )
+      return;
+    const btn = $("#aliquot-form button[type=submit]");
+    btn.disabled = true;
+    try {
+      const r = await api(`/api/samples/${sample.id}/aliquots`, {
+        method: "POST",
+        body: JSON.stringify(payload),
+      });
+      state.data.sample = r.parent;
+      state.data.lineage = r.lineage;
+      renderAll();
+      toast(
+        `分装批次 ${r.batch_no} 完成：${r.items.length} 个子样本，合计 ${r.total_quantity} ${r.unit}，剩余 ${r.remaining_after}`
+      );
+      $("#al-operator").value = operator; // 保留操作人便于连续操作
+      $("#al-note").value = "";
+      $("#al-at").value = "";
+      linState.rows = [];
+      await loadSamples(state.currentId); // 左侧列表出现新子样本
+      renderAll();
+    } catch (err) {
+      toast(err.message, true);
+      // 重复提交 / 并发变更（409）：以服务端最新状态刷新，避免再次重复提交
+      if (err.status === 409 || err.status === 404) {
+        await reloadCurrentSample(sample.id);
+      }
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  async function reloadCurrentSample(id) {
+    state.data = await api(`/api/samples/${id}`);
+    linState.rows = [];
+    renderAll();
+    await loadSamples(id);
+  }
+
+  // ---- 父子树渲染 ----
+
+  function renderLineageTree() {
+    const wrap = $("#lin-tree");
+    const lineage = state.data.lineage;
+    if (!lineage) {
+      wrap.innerHTML = `<div class="muted-cell">暂无谱系数据</div>`;
+      return;
+    }
+    wrap.innerHTML = renderLinNode(lineage.tree, 0);
+  }
+
+  function renderLinNode(node, depth) {
+    const isCurrent = node.id === state.data.sample.id;
+    const ready = node.initial_quantity != null;
+    const qty = ready
+      ? `初始 <span class="lin-qty-val">${esc(node.initial_quantity)}</span> · 剩余 <b>${esc(node.remaining_quantity)}</b> ${esc(node.unit)}`
+      : '<span class="muted-cell">未设置数量</span>';
+    const via = node.via_batch
+      ? `<div class="lin-via">来源批次
+           <a href="javascript:void(0)" data-batch="${node.via_batch.batch_id}" class="lin-batch-link">${esc(node.via_batch.batch_no)}</a>
+           · 分装量 <b>${esc(node.via_batch.aliquot_quantity)}</b> ${esc(node.via_batch.unit)}
+           · ${esc(node.via_batch.aliquot_at || "")} · ${esc(node.via_batch.operator || "")}
+         </div>`
+      : `<div class="lin-via muted-cell">根样本（无上游来源）</div>`;
+    const goBtn = isCurrent
+      ? `<span class="badge badge-pass">当前样本</span>`
+      : `<button class="link-btn btn-edit" data-go="${node.id}">进入并继续分装</button>`;
+    const children = node.children.length
+      ? `<div class="lin-children">${node.children.map((c) => renderLinNode(c, depth + 1)).join("")}</div>`
+      : "";
+    return `
+    <div class="lin-node ${isCurrent ? "current" : ""}">
+      <div class="lin-node-main">
+        <div class="lin-node-info">
+          <span class="s-code">${esc(node.code)}</span>
+          <span class="lin-name">${esc(node.name)}</span>
+          ${goBtn}
+        </div>
+        <div class="lin-qty">${qty}</div>
+        ${via}
+      </div>
+      ${children}
+    </div>`;
+  }
+
+  $("#lin-tree").addEventListener("click", async (e) => {
+    const batchLink = e.target.closest("a[data-batch]");
+    if (batchLink) {
+      openBatchDetail(Number(batchLink.dataset.batch));
+      return;
+    }
+    const goBtn = e.target.closest("button[data-go]");
+    if (goBtn) {
+      await selectSample(Number(goBtn.dataset.go));
+      document.querySelector("#lin-current")?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  });
+
+  // ---- 批次详情弹窗 ----
+
+  async function openBatchDetail(batchId) {
+    try {
+      const d = await api(`/api/aliquot-batches/${batchId}`);
+      const integrity = d.integrity_ok
+        ? `<span class="integrity-ok">✓ 快照完整，SHA-256 校验一致（批次不可变）</span>`
+        : `<span class="integrity-bad">✗ 批次快照校验不一致！</span>`;
+      const parentInfo = d.parent
+        ? `${esc(d.parent.code)} · ${esc(d.parent.name)}（当前剩余 ${esc(d.parent.remaining_quantity)} ${esc(d.parent.unit)}）`
+        : `<span class="muted-cell">父样本已不存在</span>`;
+      $("#batch-detail-body").innerHTML = `
+        <div class="signoff-meta">
+          <div><span class="meta-lbl">批次编号</span><b>${esc(d.batch_no)}</b></div>
+          <div><span class="meta-lbl">父样本</span>${parentInfo}</div>
+          <div><span class="meta-lbl">操作人</span>${esc(d.operator)}</div>
+          <div><span class="meta-lbl">分装时间</span>${esc(d.aliquot_at)}</div>
+          <div><span class="meta-lbl">创建时间</span>${esc(d.created_at)}</div>
+          <div><span class="meta-lbl">父样本版本</span>提交基于 v${d.parent_version_before}</div>
+          <div><span class="meta-lbl">单位</span>${esc(d.unit)}</div>
+          <div><span class="meta-lbl">余量变化</span>${esc(d.remaining_before)} → <b>${esc(d.remaining_after)}</b> ${esc(d.unit)}</div>
+          <div><span class="meta-lbl">分装合计</span><b>${esc(d.total_quantity)}</b> ${esc(d.unit)}（${d.item_count} 个子样本）</div>
+          <div><span class="meta-lbl">备注</span>${esc(d.note || "—")}</div>
+          <div><span class="meta-lbl">摘要校验</span>${integrity}</div>
+          <div><span class="meta-lbl">SHA-256</span><code class="digest">${esc(d.digest)}</code></div>
+        </div>
+        <div class="signoff-section">
+          <h4>分装明细（不可变）</h4>
+          <div class="table-wrap">
+            <table class="event-table">
+              <thead><tr><th>#</th><th>子样本编号</th><th>名称</th><th>分装量</th><th>子样本当前剩余</th><th>操作</th></tr></thead>
+              <tbody>
+                ${d.items
+                  .map(
+                    (it) => `
+                  <tr>
+                    <td class="col-ord">${it.seq}</td>
+                    <td><span class="s-code">${esc(it.child_code)}</span></td>
+                    <td>${esc(it.child_name || "—")}</td>
+                    <td><b>${esc(it.quantity)}</b> ${esc(it.unit)}</td>
+                    <td>${
+                      it.child_remaining_quantity == null
+                        ? '<span class="muted-cell">样本已删除</span>'
+                        : esc(it.child_remaining_quantity) + " " + esc(it.unit)
+                    }</td>
+                    <td>${
+                      it.child_sample_id
+                        ? `<button class="link-btn btn-edit" data-batch-go="${it.child_sample_id}">进入子样本</button>`
+                        : ""
+                    }</td>
+                  </tr>`
+                  )
+                  .join("")}
+              </tbody>
+            </table>
+          </div>
+        </div>`;
+      $("#batch-modal").hidden = false;
+    } catch (err) {
+      toast(err.message, true);
+    }
+  }
+
+  $("#batch-detail-body").addEventListener("click", async (e) => {
+    const btn = e.target.closest("button[data-batch-go]");
+    if (btn) {
+      $("#batch-modal").hidden = true;
+      await selectSample(Number(btn.dataset.batchGo));
+      document.querySelector("#lin-current")?.scrollIntoView({ behavior: "smooth", block: "center" });
+    }
+  });
+
+  const batchModal = $("#batch-modal");
+  $("#btn-close-batch").addEventListener("click", () => (batchModal.hidden = true));
+  batchModal.addEventListener("click", (e) => {
+    if (e.target === batchModal) batchModal.hidden = true;
   });
 
   // ---------- 报告导出 ----------

@@ -130,6 +130,71 @@
           </div>
         </section>
 
+        <!-- 样本分装谱系 -->
+        <section class="card">
+          <div class="card-head">
+            <h3>样本分装谱系</h3>
+            <span class="head-hint">首次分装前设置初始数量与单位；一次分装多个子样本，精确十进制校验余量；批次不可变，子样本可继续分装</span>
+          </div>
+
+          <!-- 当前样本数量状态 -->
+          <div id="lin-current" class="lin-current"></div>
+
+          <!-- 首次分装前：设置初始数量与单位 -->
+          <form id="qty-form" class="event-form" hidden>
+            <p class="import-format-hint">
+              该样本尚未设置初始数量与单位。<b>初始数量与单位仅可在首次分装前设置一次</b>，
+              之后不可修改；子样本将继承同一单位。
+            </p>
+            <div class="form-grid form-grid-3">
+              <label>初始数量
+                <input type="text" id="q-amount" maxlength="40" inputmode="decimal" placeholder="精确十进制，如 100 或 0.250" required />
+                <small>支持整数 / 小数字符串（精确十进制，不接受浮点误差）</small>
+              </label>
+              <label>计量单位
+                <input type="text" id="q-unit" maxlength="16" placeholder="如 mL / g / 支" required />
+              </label>
+              <label class="form-note">
+                <span class="lin-version-hint"></span>
+              </label>
+            </div>
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary">保存初始数量与单位</button>
+            </div>
+          </form>
+
+          <!-- 发起分装 -->
+          <form id="aliquot-form" class="event-form" hidden>
+            <div class="form-grid form-grid-3">
+              <label>操作人
+                <input type="text" id="al-operator" maxlength="64" placeholder="如：留样管理员 赵六" required />
+              </label>
+              <label>分装时间
+                <input type="datetime-local" id="al-at" step="1" />
+                <small>留空使用服务端当前时间</small>
+              </label>
+              <label class="form-note">备注
+                <input type="text" id="al-note" maxlength="512" placeholder="可选，如：留样 60、复检 30" />
+              </label>
+            </div>
+            <div class="al-rows-head">
+              <span class="head-hint">子样本（编号全局唯一；分装量为正且合计不超过可用余量 <b id="al-available"></b>）</span>
+              <button type="button" id="btn-add-al-row" class="btn btn-small">＋ 添加子样本</button>
+            </div>
+            <div id="al-rows" class="al-rows"></div>
+            <div id="al-sum" class="al-sum"></div>
+            <div class="form-actions">
+              <button type="submit" class="btn btn-primary">执行分装</button>
+            </div>
+          </form>
+
+          <!-- 父子树 -->
+          <div class="lin-tree-wrap">
+            <div class="lin-tree-lbl">来源 / 批次 / 分装量 / 剩余量（点击样本可跳转继续分装；点击批次号查看不可变批次详情）</div>
+            <div id="lin-tree" class="lin-tree"></div>
+          </div>
+        </section>
+
         <!-- 审计结论 -->
         <section class="card">
           <div class="card-head">
@@ -538,6 +603,17 @@
       <div id="finding-history-body" class="signoff-detail"></div>
       <div class="form-actions">
         <button type="button" id="btn-close-finding-history" class="btn btn-ghost">关闭</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 分装批次详情弹窗 -->
+  <div id="batch-modal" class="modal-mask" hidden>
+    <div class="modal modal-wide">
+      <h3>分装批次详情</h3>
+      <div id="batch-detail-body" class="signoff-detail"></div>
+      <div class="form-actions">
+        <button type="button" id="btn-close-batch" class="btn btn-ghost">关闭</button>
       </div>
     </div>
   </div>

@@ -34,6 +34,16 @@ from .attachments import (
     verify_and_prepare_download,
 )
 
+from .aliquots import (
+    AliquotError,
+    build_lineage_tree,
+    create_aliquot,
+    deletion_blocked_reason,
+    get_batch_detail,
+    quantity_dict,
+    set_initial_quantity,
+)
+
 from .audit import build_audit
 from .bulk_import import (
     CSV_HEADERS,
@@ -69,6 +79,7 @@ from .seal_package import (
     verify_seal_package,
 )
 from .schemas import (
+    AliquotCreate,
     BulkImportConfirm,
     EventCreate,
     FindingClaim,
@@ -76,6 +87,7 @@ from .schemas import (
     FindingRelease,
     HandoverConfirm,
     SampleCreate,
+    SampleQuantityInit,
     SignoffCreate,
     SignoffRevoke,
 )
@@ -107,6 +119,7 @@ def _sample_dict(row: Any) -> dict[str, Any]:
         "name": row["name"],
         "description": row["description"],
         "created_at": row["created_at"],
+        **quantity_dict(row),
     }
 
 
@@ -174,6 +187,7 @@ def get_sample(sample_id: int, conn: Connection = Depends(get_conn)) -> dict[str
         "signoffs": _list_signoffs(conn, sample_id),
         "handovers": build_handover_view(conn, sample_id),
         "attachments": list_sample_attachments(conn, sample_id),
+        "lineage": build_lineage_tree(conn, sample_id),
     }
 
 
@@ -187,9 +201,79 @@ def delete_sample(sample_id: int, conn: Connection = Depends(get_conn)) -> Respo
             status_code=409,
             detail=f"该样本下还有 {attached} 个事件证据附件，请先处理（删除）附件后再删除样本",
         )
+    # 已有分装后代（或本身由批次产生）的样本禁止删除：批次记录不可变
+    blocked = deletion_blocked_reason(conn, sample_id)
+    if blocked:
+        raise HTTPException(status_code=409, detail=blocked)
     conn.execute("DELETE FROM samples WHERE id = ?", (sample_id,))
     conn.commit()
     return Response(status_code=204)
+
+
+# ---------- 样本分装谱系 ----------
+
+@app.put("/api/samples/{sample_id}/quantity")
+def init_sample_quantity(
+    sample_id: int, payload: SampleQuantityInit, conn: Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """首次分装前设置初始数量与单位（仅允许一次），须携带样本当前版本。"""
+    _fetch_sample(conn, sample_id)
+    try:
+        return set_initial_quantity(
+            conn,
+            sample_id,
+            payload.initial_quantity,
+            payload.unit,
+            payload.expected_version,
+        )
+    except AliquotError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+
+
+@app.post("/api/samples/{sample_id}/aliquots", status_code=201)
+def create_sample_aliquot(
+    sample_id: int, payload: AliquotCreate, conn: Connection = Depends(get_conn)
+) -> dict[str, Any]:
+    """从当前样本发起一次分装：单事务内校验编号唯一 / 单位一致 / 分装量为正 /
+    合计不超余量，成功后创建子样本、扣减余量并保存不可变批次。
+
+    必须携带父样本版本 ``expected_version``；重复提交或并发变更返回 409，
+    任何失败均整体回滚，不产生部分记录。
+    """
+    _fetch_sample(conn, sample_id)
+    items = [i.model_dump() for i in payload.items]
+    try:
+        result = create_aliquot(
+            conn,
+            sample_id,
+            payload.operator,
+            items,
+            aliquot_at=payload.aliquot_at,
+            note=payload.note,
+            expected_version=payload.expected_version,
+        )
+    except AliquotError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
+    # 回传刷新后的父样本与谱系树，便于前端直接渲染
+    result["parent"] = _fetch_sample(conn, sample_id)
+    result["lineage"] = build_lineage_tree(conn, sample_id)
+    return result
+
+
+@app.get("/api/samples/{sample_id}/lineage")
+def get_sample_lineage(sample_id: int, conn: Connection = Depends(get_conn)) -> dict[str, Any]:
+    """父子谱系树：根样本到全部后代，含来源批次、分装量、初始量与剩余量。"""
+    _fetch_sample(conn, sample_id)
+    return build_lineage_tree(conn, sample_id)
+
+
+@app.get("/api/aliquot-batches/{batch_id}")
+def get_aliquot_batch(batch_id: int, conn: Connection = Depends(get_conn)) -> dict[str, Any]:
+    """批次详情：批次头 + 子样本明细 + 不可变快照与现场 SHA-256 完整性校验。"""
+    try:
+        return get_batch_detail(conn, batch_id)
+    except AliquotError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.message)
 
 
 # ---------- 交接事件 ----------

@@ -613,3 +613,57 @@ tr.att-row-corrupt { background: #fff5f5; }
   background: var(--bad-text); color: #fff;
 }
 .seal-issue-msg { flex: 1; min-width: 200px; }
+
+/* ---------- 样本分装谱系 ---------- */
+.lin-current {
+  display: flex; gap: 8px; flex-wrap: wrap;
+  padding: 10px 0 12px;
+}
+.lin-version-hint { font-size: 12px; color: var(--muted); }
+
+.al-rows-head {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 10px; flex-wrap: wrap; margin: 10px 0 6px;
+}
+.al-rows { display: flex; flex-direction: column; gap: 6px; }
+.al-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 1.1fr) minmax(160px, 1.4fr) minmax(110px, 0.7fr) auto;
+  gap: 8px; align-items: center;
+}
+.al-row input {
+  width: 100%; padding: 7px 10px;
+  border: 1px solid var(--border); border-radius: 6px; font-size: 13.5px;
+}
+.al-row input:focus { outline: none; border-color: var(--primary); }
+.al-sum { margin: 8px 0 2px; display: flex; gap: 8px; flex-wrap: wrap; }
+
+.lin-tree-wrap { margin-top: 14px; border-top: 1px dashed var(--border); padding-top: 12px; }
+.lin-tree-lbl { font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+.lin-tree { font-size: 13.5px; }
+.lin-node {
+  position: relative;
+  margin-left: 26px;
+  padding-left: 18px;
+  border-left: 1px solid var(--border);
+}
+.lin-node::before {
+  content: ""; position: absolute; left: 0; top: 22px;
+  width: 16px; height: 0; border-top: 1px solid var(--border);
+}
+.lin-children { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+.lin-node-main {
+  background: #f8fafc; border: 1px solid var(--border);
+  border-radius: 8px; padding: 8px 12px;
+}
+.lin-node.current > .lin-node-main {
+  background: #eff6ff; border-color: #93c5fd;
+  box-shadow: 0 0 0 1px #bfdbfe inset;
+}
+.lin-node-info { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.lin-node-info .s-code { font-size: 13.5px; }
+.lin-name { color: var(--text); font-weight: 600; }
+.lin-qty { font-size: 12.5px; color: var(--muted); margin-top: 3px; }
+.lin-via { font-size: 12px; color: var(--muted); margin-top: 3px; }
+.lin-batch-link { color: var(--primary); text-decoration: none; font-weight: 600; }
+.lin-batch-link:hover { text-decoration: underline; }

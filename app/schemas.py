@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import re
-from typing import Optional
+from typing import Optional, Union
 
 from pydantic import BaseModel, Field, field_validator, model_validator
+
+from .aliquots import clean_decimal, clean_unit
 
 _TIME_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}(:\d{2})?$"
@@ -215,3 +217,108 @@ class FindingRelease(BaseModel):
     @classmethod
     def _strip_note(cls, v: str) -> str:
         return v.strip()
+
+
+# ---------- 样本分装谱系 ----------
+
+# 精确十进制数量：仅接受字符串 / 整数（拒绝 float 的二进制误差）；
+# 归一化在 service 层 clean_decimal 完成，这里先做形态与精度校验。
+QuantityInput = Union[str, int]
+
+
+def _validate_quantity(value, field_name: str = "数量") -> str:
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name}必须是正数")
+    if isinstance(value, float):
+        raise ValueError(f"{field_name}请以字符串或整数提交精确十进制（不接受浮点数）")
+    try:
+        return clean_decimal(value, field=field_name)
+    except ValueError as exc:
+        raise ValueError(str(exc))
+
+
+class SampleQuantityInit(BaseModel):
+    """首次分装前设置父样本初始数量与单位（仅允许一次）。"""
+
+    initial_quantity: QuantityInput
+    unit: str = Field(..., min_length=1, max_length=16)
+    expected_version: int = Field(..., ge=0)
+
+    @field_validator("initial_quantity", mode="before")
+    @classmethod
+    def _qty(cls, v):
+        return _validate_quantity(v, "初始数量")
+
+    @field_validator("unit")
+    @classmethod
+    def _unit(cls, v: str) -> str:
+        try:
+            return clean_unit(v)
+        except ValueError as exc:
+            raise ValueError(str(exc))
+
+
+class AliquotItem(BaseModel):
+    """一次分装中的单个子样本：编号 + 分装量（名称可选，默认取编号）。"""
+
+    code: str = Field(..., min_length=1, max_length=64)
+    name: Optional[str] = Field(None, max_length=128)
+    quantity: QuantityInput
+
+    @field_validator("code")
+    @classmethod
+    def _strip_code(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("子样本编号不能为空")
+        return v
+
+    @field_validator("name")
+    @classmethod
+    def _strip_name(cls, v):
+        return v.strip() if v else None
+
+    @field_validator("quantity", mode="before")
+    @classmethod
+    def _qty(cls, v):
+        return _validate_quantity(v, "分装量")
+
+
+class AliquotCreate(BaseModel):
+    """从当前样本发起一次分装：多个子样本编号与分装量。
+
+    必须携带父样本当前版本 ``expected_version``；分装时间缺省取服务端当前
+    时间。单位由父样本继承，客户端不能为子样本指定不同单位。
+    """
+
+    items: list[AliquotItem] = Field(..., min_length=1)
+    operator: str = Field(..., min_length=1, max_length=64)
+    aliquot_at: Optional[str] = None
+    note: str = Field("", max_length=512)
+    expected_version: int = Field(..., ge=0)
+
+    @field_validator("operator")
+    @classmethod
+    def _strip_operator(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("操作人不能为空")
+        return v
+
+    @field_validator("aliquot_at")
+    @classmethod
+    def _norm_aliquot_at(cls, v):
+        return _normalize_time(v, "分装时间")
+
+    @field_validator("note")
+    @classmethod
+    def _strip_note(cls, v: str) -> str:
+        return v.strip()
+
+    @model_validator(mode="after")
+    def _check_duplicate_codes(self) -> "AliquotCreate":
+        codes = [i.code for i in self.items]
+        dup = {c for c in codes if codes.count(c) > 1}
+        if dup:
+            raise ValueError(f"子样本编号在本次请求中重复：{'、'.join(sorted(dup))}")
+        return self

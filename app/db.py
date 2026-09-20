@@ -53,7 +53,18 @@ CREATE TABLE IF NOT EXISTS samples (
     code        TEXT    NOT NULL UNIQUE,
     name        TEXT    NOT NULL,
     description TEXT    NOT NULL DEFAULT '',
-    created_at  TEXT    NOT NULL
+    created_at  TEXT    NOT NULL,
+    -- 样本分装谱系：初始数量 / 剩余余量以规范十进制文本精确存储（NULL 表示
+    -- 尚未在首次分装前设置）；version 为父样本乐观锁，任何成功分装 +1。
+    initial_quantity   TEXT,
+    remaining_quantity TEXT,
+    unit               TEXT,
+    version            INTEGER NOT NULL DEFAULT 0,
+    -- 谱系来源：由哪个父样本、经哪一批次产生（根样本均为 NULL）。
+    -- 外键不加 ON DELETE CASCADE：批次与明细不可变，已有后代 / 由批次产生
+    -- 的样本在应用层禁止删除（RESTRICT 兜底）。
+    parent_sample_id   INTEGER REFERENCES samples(id),
+    batch_id           INTEGER
 );
 
 CREATE TABLE IF NOT EXISTS events (
@@ -193,6 +204,45 @@ CREATE TABLE IF NOT EXISTS attachments (
 
 CREATE INDEX IF NOT EXISTS idx_attachments_event ON attachments(event_id);
 CREATE INDEX IF NOT EXISTS idx_attachments_digest ON attachments(blob_digest);
+
+-- 样本分装谱系：一次「分装」产生一个不可变批次（aliquot_batches）与多条
+-- 明细（aliquot_items）。批次在单一事务内随子样本创建、父样本余量扣减一起
+-- 写入；snapshot 固化父样本当时状态与全部分装量，digest 为其 SHA-256。
+-- 批次 / 明细一经写入即不可修改、不可删除（应用层不提供更新接口）。
+CREATE TABLE IF NOT EXISTS aliquot_batches (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_no               TEXT    NOT NULL UNIQUE,
+    parent_sample_id       INTEGER NOT NULL REFERENCES samples(id),
+    parent_code            TEXT    NOT NULL,
+    parent_version_before  INTEGER NOT NULL,
+    unit                   TEXT    NOT NULL,
+    total_quantity         TEXT    NOT NULL,
+    remaining_before       TEXT    NOT NULL,
+    remaining_after        TEXT    NOT NULL,
+    operator               TEXT    NOT NULL,
+    aliquot_at             TEXT    NOT NULL,
+    note                   TEXT    NOT NULL DEFAULT '',
+    item_count             INTEGER NOT NULL,
+    snapshot               TEXT    NOT NULL DEFAULT '',
+    digest                 TEXT    NOT NULL DEFAULT '',
+    created_at             TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_aliquot_batches_parent ON aliquot_batches(parent_sample_id);
+
+CREATE TABLE IF NOT EXISTS aliquot_items (
+    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+    batch_id         INTEGER NOT NULL REFERENCES aliquot_batches(id),
+    seq              INTEGER NOT NULL,
+    child_sample_id  INTEGER NOT NULL UNIQUE REFERENCES samples(id),
+    child_code       TEXT    NOT NULL,
+    quantity         TEXT    NOT NULL,
+    unit             TEXT    NOT NULL,
+    created_at       TEXT    NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_aliquot_items_batch ON aliquot_items(batch_id);
+-- idx_samples_parent 在 _migrate() 补齐谱系列之后创建（旧库该列尚不存在）
 """
 
 
@@ -215,6 +265,23 @@ def _migrate(conn: sqlite3.Connection) -> None:
     if "event" not in trans_cols:
         conn.execute("ALTER TABLE finding_transitions ADD COLUMN event TEXT NOT NULL DEFAULT 'state'")
         conn.execute("UPDATE finding_transitions SET event = 'state' WHERE event IS NULL OR event = ''")
+
+    # samples 增加分装谱系列（初始数量 / 剩余量 / 单位 / 乐观锁版本 / 谱系来源）
+    sample_cols = {r["name"] for r in conn.execute("PRAGMA table_info(samples)")}
+    for name, ddl in (
+        ("initial_quantity", "ALTER TABLE samples ADD COLUMN initial_quantity TEXT"),
+        ("remaining_quantity", "ALTER TABLE samples ADD COLUMN remaining_quantity TEXT"),
+        ("unit", "ALTER TABLE samples ADD COLUMN unit TEXT"),
+        ("version", "ALTER TABLE samples ADD COLUMN version INTEGER NOT NULL DEFAULT 0"),
+        ("parent_sample_id", "ALTER TABLE samples ADD COLUMN parent_sample_id INTEGER"),
+        ("batch_id", "ALTER TABLE samples ADD COLUMN batch_id INTEGER"),
+    ):
+        if name not in sample_cols:
+            conn.execute(ddl)
+    # 谱系列补齐后再建索引（新库 SCHEMA 已建表含该列，此处幂等）
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_samples_parent ON samples(parent_sample_id)"
+    )
 
 
 def init_db() -> None:
@@ -287,6 +354,114 @@ def _seed_demo_data(conn: sqlite3.Connection) -> None:
         event_ids2.append(ins.lastrowid)
 
     _seed_handovers(conn, sid, event_ids, rows, sid2, event_ids2, rows2, now)
+    _seed_lineage(conn, sid, now)
+
+
+def _seed_lineage(conn: sqlite3.Connection, sid: int, now: str) -> None:
+    """预置一个两级分装谱系演示：父样本 100 mL -> 两个子样本 -> 一个孙样本。
+
+    与真实分装走同一批校验后的结果一致（批次行 + 明细 + SHA-256 快照），
+    但不经 API，直接在初始化事务内写入。
+    """
+    import json
+
+    from .aliquots import batch_digest
+
+    parent = conn.execute("SELECT code FROM samples WHERE id = ?", (sid,)).fetchone()
+    code = parent["code"]
+
+    def insert_batch(parent_id, parent_code, version_before, remaining_before,
+                     children, aliquot_at, operator="赵六（留样管理员）", note="演示分装"):
+        from decimal import Decimal
+
+        unit = "mL"
+        total = sum((Decimal(q) for _, _, q, _ in children), Decimal("0"))
+        remaining_after = format(Decimal(remaining_before) - total, "f")
+        # 父样本若已有批次，批次数顺延
+        existed = conn.execute(
+            "SELECT COUNT(*) FROM aliquot_batches WHERE parent_sample_id = ?", (parent_id,)
+        ).fetchone()[0]
+        batch_no = f"ALQ-{parent_code}-{existed + 1:03d}"
+
+        bcur = conn.execute(
+            "INSERT INTO aliquot_batches (batch_no, parent_sample_id, parent_code, "
+            "parent_version_before, unit, total_quantity, remaining_before, "
+            "remaining_after, operator, aliquot_at, note, item_count, snapshot, "
+            "digest, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                batch_no, parent_id, parent_code, version_before, unit,
+                format(total, "f"), remaining_before, remaining_after,
+                operator, aliquot_at, note, len(children), "", "", now,
+            ),
+        )
+        batch_id = bcur.lastrowid
+        snapshot_items = []
+        for seq, (ccode, cname, qty, desc) in enumerate(children, start=1):
+            cc = conn.execute(
+                "INSERT INTO samples (code, name, description, created_at, "
+                "initial_quantity, remaining_quantity, unit, version, "
+                "parent_sample_id, batch_id) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                (ccode, cname, desc, aliquot_at, qty, qty, unit, parent_id, batch_id),
+            )
+            child_id = cc.lastrowid
+            conn.execute(
+                "INSERT INTO aliquot_items (batch_id, seq, child_sample_id, "
+                "child_code, quantity, unit, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (batch_id, seq, child_id, ccode, qty, unit, now),
+            )
+            snapshot_items.append(
+                {"seq": seq, "child_sample_id": child_id, "child_code": ccode,
+                 "child_name": cname, "quantity": qty}
+            )
+
+        conn.execute(
+            "UPDATE samples SET remaining_quantity = ?, version = version + 1 WHERE id = ?",
+            (remaining_after, parent_id),
+        )
+        snapshot = {
+            "batch_no": batch_no, "parent_sample_id": parent_id,
+            "parent_code": parent_code, "parent_version_before": version_before,
+            "unit": unit, "total_quantity": format(total, "f"),
+            "remaining_before": remaining_before, "remaining_after": remaining_after,
+            "operator": operator, "aliquot_at": aliquot_at, "note": note,
+            "items": snapshot_items,
+        }
+        digest = batch_digest(snapshot)
+        conn.execute(
+            "UPDATE aliquot_batches SET snapshot = ?, digest = ? WHERE id = ?",
+            (json.dumps(snapshot, ensure_ascii=False, sort_keys=True), digest, batch_id),
+        )
+        return batch_id
+
+    # 父样本先设置初始数量 100 mL（version 0 -> 1）
+    conn.execute(
+        "UPDATE samples SET initial_quantity = '100', remaining_quantity = '100', "
+        "unit = 'mL', version = 1 WHERE id = ?",
+        (sid,),
+    )
+    t1 = "2026-01-01 15:30:00"
+    batch1 = insert_batch(
+        sid, code, 1, "100",
+        [
+            ("SAM-DEMO-001-A", "演示子样本·留样 A", "60", "由父样本 SAM-DEMO-001 分装留样 60 mL"),
+            ("SAM-DEMO-001-B", "演示子样本·复检 B", "30", "由父样本 SAM-DEMO-001 分装复检 30 mL"),
+        ],
+        t1,
+    )
+    # 子样本 A（初始 60 mL）继续分装出一个孙样本，演示「从子样本继续分装」
+    child_a = conn.execute(
+        "SELECT id FROM samples WHERE code = 'SAM-DEMO-001-A'"
+    ).fetchone()["id"]
+    insert_batch(
+        child_a, "SAM-DEMO-001-A", 1, "60",
+        [
+            ("SAM-DEMO-001-A-1", "演示孙样本·上机检测", "20",
+             "由子样本 SAM-DEMO-001-A 分装上机检测 20 mL"),
+        ],
+        "2026-01-01 16:00:00",
+        operator="王五（检测组）",
+        note="从子样本继续分装",
+    )
 
 
 def _seed_handovers(
